@@ -50,12 +50,17 @@ pickle.dump(s_hat, open('data/pickle/s_hat_vae.p', 'wb'), protocol=4)
 
 ############################## STCN ############################################
 
-stcn_model_path = 'models/stcn_200_vloss_0_109.pt'
+stcn_path = 'models/stcn_2021-03-18_14:14:59_192_vloss_850.pt'
+time_stemp = stcn_path[0:31]
 
-stcn = STCN(input_dim=513, tcn_channels=[64, 32, 16, 8], 
-    latent_channels=[32, 16, 8, 4]).to(device)  
+with open('{}_param.pkl'.format(time_stemp), 'rb') as f: 
+    input_dim, tcn_channels, latent_channels, dec_channels, concat_z, dropout, \
+        kernel_size = pickle.load(f)
 
-stcn.load_state_dict(torch.load(stcn_model_path))
+stcn = STCN(input_dim, tcn_channels, latent_channels, dec_channels, concat_z,
+    dropout, kernel_size).to(device)  
+
+stcn.load_state_dict(torch.load(stcn_path))
 stcn.eval()
 for param in stcn.parameters(): param.requires_grad = False
 

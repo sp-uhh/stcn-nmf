@@ -3,10 +3,29 @@ import torch
 from torch import nn, optim
 
 
-class ResidualBlock(nn.Module):
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, 
+        dropout=0.2, activation=torch.tanh):
+        super(ConvBlock, self).__init__()
+        
+        self.padding = nn.ConstantPad1d(((kernel_size - 1) * dilation, 0), 0)
+        self.conv = nn.utils.weight_norm(nn.Conv1d(in_channels, 
+            out_channels, kernel_size, dilation=dilation))
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)         
+        self.init_weights()
+        
+    def init_weights(self):
+        self.conv.weight.data.normal_(0, 0.01)
+        
+    def forward(self, x):
+        return self.dropout(self.activation(self.conv(self.padding(x))))
+
+
+class ResidualBlockRes(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dilation, 
         dropout=0.2, activation=nn.ReLU()):
-        super(ResidualBlock, self).__init__()
+        super(ResidualBlockRes, self).__init__()
         
         self.resample = (nn.utils.weight_norm(nn.Conv1d(in_channels, 
             out_channels, 1)) if in_channels != out_channels else None)
@@ -14,8 +33,7 @@ class ResidualBlock(nn.Module):
         self.convolution = nn.utils.weight_norm(nn.Conv1d(out_channels, 
             out_channels, kernel_size, dilation=dilation))
         self.activation = activation
-        self.dropout = nn.Dropout(dropout)     
-        
+        self.dropout = nn.Dropout(dropout)         
         self.init_weights()
         
     def init_weights(self):
@@ -31,11 +49,11 @@ class ResidualBlock(nn.Module):
 
 class TCN(nn.Module):
     def __init__(self, channels, kernel_size=2, dropout=0.2, 
-        activation=nn.ReLU()):
+        activation=torch.tanh):
         super(TCN, self).__init__()
         
         self.channels = channels
-        self.layers = nn.Sequential(*[ResidualBlock(channels[i], channels[i+1],
+        self.layers = nn.Sequential(*[ConvBlock(channels[i], channels[i+1],
             kernel_size, 2**i, dropout, activation) for i in range(
             len(channels) - 1)]) 
     
@@ -51,201 +69,124 @@ class TCN(nn.Module):
     
 
 class LatentLayer(nn.Module):
-    def __init__(self, tcn_dim, latent_dim_in, latent_dim_out, hidden_dim, 
-        num_hidden_layers):
+    def __init__(self, tcn_dim, latent_dim_in, latent_dim_out, num_hid_layers):
         super(LatentLayer, self).__init__()
         
-        self.num_hidden_layers = num_hidden_layers
+        self.num_hid_layers = num_hid_layers
         
-        self.enc_in = nn.Conv1d(tcn_dim+latent_dim_in, hidden_dim, 1)
-        self.enc_hidden = nn.Sequential(*[nn.Conv1d(hidden_dim, hidden_dim, 1) 
-                                         for _ in range(num_hidden_layers)])
-        self.enc_out_1 = nn.Conv1d(hidden_dim, latent_dim_out, 1)
-        self.enc_out_2 = nn.Conv1d(hidden_dim, latent_dim_out, 1)
+        self.enc_in = nn.Linear(tcn_dim+latent_dim_in, tcn_dim)
+        self.enc_hidden = nn.Sequential(*[nn.Linear(tcn_dim, tcn_dim) 
+                                         for _ in range(num_hid_layers-1)])
+        self.enc_out_1 = nn.Linear(tcn_dim, latent_dim_out)
+        self.enc_out_2 = nn.Linear(tcn_dim, latent_dim_out)
 
     def forward(self, x):
-        h = torch.tanh(self.enc_in(x))
-        for i in range(self.num_hidden_layers):
-            h = torch.tanh(self.enc_hidden[i](h))     
-        return self.enc_out_1(h), self.enc_out_2(h)
+        h = torch.transpose(x, 1, 2) # (N, D+Z, L) -> (N, L, D+Z)
+        h = torch.tanh(self.enc_in(h))
+        for i in range(self.num_hid_layers-1):
+            h = torch.tanh(self.enc_hidden[i](h))  
+        mu = torch.transpose(self.enc_out_1(h), 1, 2) # (N, L, D) -> (N, D, L)
+        logvar = torch.transpose(self.enc_out_1(h), 1, 2) 
+        return mu, logvar
 
 
-class PriorModel(nn.Module):
-    def __init__(self, tcn_channels, latent_channels, num_hidden_layers):
-        super(PriorModel, self).__init__()
+class Encoder(nn.Module):
+    def __init__(self, tcn_channels, latent_channels, concat_z, num_hid_layers):
+        super(Encoder, self).__init__()
         
         self.layers = [LatentLayer(tcn_channels[i], latent_channels[i+1], 
-            latent_channels[i], latent_channels[i], num_hidden_layers) \
+            latent_channels[i], num_hid_layers) \
             for i in range(len(tcn_channels)-1)]  
         self.layers += [LatentLayer(tcn_channels[-1], 0, latent_channels[-1], 
-            latent_channels[-1], num_hidden_layers)]
-        self.layers = nn.ModuleList(self.layers)
-
-        self.min_logvar = math.log(0.001)
-        self.max_logvar = math.log(5.0)
-                
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-        return mu + eps*std
-                
-    def forward(self, d):
-        # top-down
-        mu_p, logvar_p = self.layers[-1](d[-1])
-        mu_p = [mu_p]; logvar_p = [torch.clamp(logvar_p, self.min_logvar, 
-            self.max_logvar)]
-        z = [self.reparameterize(mu_p[-1], logvar_p[-1])]
-        for i in reversed(range(len(self.layers)-1)):
-            _mu_p, _logvar_p = self.layers[i](torch.cat((d[i], z[-1]), dim=1))
-            z += [self.reparameterize(_mu_p, torch.clamp(_logvar_p, 
-                self.min_logvar, self.max_logvar))]
-            mu_p += [_mu_p]
-            logvar_p += [torch.clamp(_logvar_p, self.min_logvar, 
-                self.max_logvar)]
-        z.reverse(); mu_p.reverse(); logvar_p.reverse()
-        z_cat = torch.cat([z[l] for l in range(len(z))], dim=1)
-        return z_cat, mu_p, logvar_p
-
-
-class InferenceModel(nn.Module):
-    def __init__(self, tcn_channels, latent_channels, num_hidden_layers):
-        super(InferenceModel, self).__init__()
-        
-        self.layers = [LatentLayer(tcn_channels[i], latent_channels[i+1], 
-            latent_channels[i], latent_channels[i], num_hidden_layers) \
-            for i in range(len(tcn_channels)-1)]  
-        self.layers += [LatentLayer(tcn_channels[-1], 0, latent_channels[-1], 
-            latent_channels[-1], num_hidden_layers)]
+            num_hid_layers)]
         self.layers = nn.ModuleList(self.layers) 
 
         self.min_logvar = math.log(0.001)
         self.max_logvar = math.log(5.0)
+        self.concat_z = concat_z
                 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
         return mu + eps*std
         
-    def forward(self, d, mu_p, logvar_p):
+    def forward(self, d):
         # top-down
         mu_q_hat, logvar_q_hat = self.layers[-1](d[-1])   
-        logvar_q = [torch.clamp(2*(logvar_q_hat+logvar_p[-1]), self.min_logvar, 
-            self.max_logvar)]
-        mu_q = [torch.exp(logvar_q[0])*(mu_q_hat*torch.pow(torch.exp(
-            logvar_q_hat), -2) + mu_p[-1]*torch.pow(torch.exp(
-            logvar_p[-1]), -2))]   
+        logvar_q = [logvar_q_hat]
+        mu_q = [mu_q_hat]   
         z = [self.reparameterize(mu_q[0], logvar_q[0])]
         for i in reversed(range(len(self.layers)-1)):
             mu_q_hat, logvar_q_hat = self.layers[i](torch.cat((d[i], z[-1]), 
                 dim=1))
-            logvar_q_hat = torch.clamp(logvar_q_hat, self.min_logvar, 
-                self.max_logvar)
-            logvar_q += [torch.clamp(2*(logvar_q_hat+logvar_p[i]), 
-                self.min_logvar, self.max_logvar)]
-            mu_q += [torch.exp(logvar_q[-1])*(mu_q_hat*torch.pow(torch.exp(
-                logvar_q_hat), -2) + mu_p[i]*torch.pow(torch.exp(
-                logvar_p[i]), -2))]         
+            logvar_q += [logvar_q_hat]
+            mu_q += [logvar_q_hat]         
             z += [self.reparameterize(mu_q[-1], logvar_q[-1])]
-        z.reverse(); mu_q.reverse(); logvar_q.reverse()
-        z_cat = torch.cat([z[l] for l in range(len(z))], dim=1)
-        return z_cat, mu_q, logvar_q
+        z.reverse(); mu_q.reverse(); logvar_q.reverse() # [z_1, ..., z_L]
+        if self.concat_z: 
+            z = torch.cat([z[l] for l in range(len(z))], dim=1)
+        else:
+            z = z[0]
+        return z, mu_q, logvar_q
 
 
-class GenerativeModelTCN(TCN):
-    def __init__(self, channels, kernel_size=2, dropout=0.2, 
-        activation=nn.ReLU()):
-        super(GenerativeModelTCN, self).__init__(channels, kernel_size, dropout, 
-            activation)
-
-    def forward(self, z):
-        z_cat = torch.cat([z[l] for l in range(len(z))], dim=1)
-        return self.layers(z_cat)
+class Decoder(nn.Module):
+    def __init__(self, dec_channels):
+        super(Decoder, self).__init__()
                 
-    
-class GenerativeModel(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, num_hidden_layers):
-        super(GenerativeModel, self).__init__()
-                
-        self.num_hidden_layers = num_hidden_layers
-        
-        self.input = nn.Conv1d(input_dim, hidden_dim, 1)
-        self.hidden = nn.Sequential(*[nn.Conv1d(hidden_dim, hidden_dim, 1) 
-                                         for _ in range(num_hidden_layers)])
-        self.out = nn.Conv1d(hidden_dim, output_dim, 1)
+        self.dec_layers = nn.ModuleList([nn.Linear(dec_channels[i], 
+            dec_channels[i+1]) for i in range(len(dec_channels) - 1)])
 
-    def forward(self, z):
-        # z_cat = torch.cat([z[l] for l in range(len(z))], dim=1)
-        h = torch.tanh(self.input(z))
-        for l in range(self.num_hidden_layers):
-            h = torch.tanh(self.hidden[l](h)) 
-        x_hat = torch.exp(self.out(h))
-        return x_hat
+    def forward(self, h):
+        h = torch.transpose(h, 1, 2) # (N, F, L) -> (N, L, F)
+        for dec_layer in self.dec_layers[:-1]: 
+            h = torch.tanh(dec_layer(h))  
+        recon = torch.exp(self.dec_layers[-1](h)) 
+        recon = torch.transpose(recon, 1, 2) # (N, L, F) -> (N, F, L)
+        return recon
+
+
+class DecoderTCN(nn.Module):
+    def __init__(self, dec_channels, kernel_size=2, dropout=0.1, activation=torch.tanh):
+        super(DecoderTCN, self).__init__()
+
+        self.pad = [nn.ConstantPad1d(((kernel_size - 1) * 2**i, 0), 0) \
+            for i in range(len(dec_channels) - 1)]
+
+        self.layers = nn.Sequential(*[nn.Conv1d(dec_channels[i], dec_channels[i+1],
+            kernel_size, dilation=2**i, padding_mode='reflect') for i in range(
+            len(dec_channels) - 1)]) 
+
+    def forward(self, h):
+        for i, layer in enumerate(self.layers[:-1]): 
+            h = self.pad[i](h)
+            h = torch.tanh(layer(h))  
+        h = self.pad[-1](h)
+        recon = torch.exp(self.layers[-1](h)) 
+        return recon
     
 
 class STCN(nn.Module):
-    def __init__(self, input_dim, tcn_channels, latent_channels,
-                 kernel_size=2, dropout=0.2):
+    def __init__(self, input_dim, tcn_channels, latent_channels, dec_channels,
+                 concat_z=False, dropout=0.2, kernel_size=2):
         super(STCN, self).__init__()
         
         self.tcn = TCN([input_dim]+tcn_channels, kernel_size, dropout)   
-        self.prior = PriorModel(tcn_channels, latent_channels, 
-            num_hidden_layers=1)
-        self.approx_posterior = InferenceModel(tcn_channels, latent_channels, 
-            num_hidden_layers=1)    
-        self.generative_model = GenerativeModel(input_dim=sum(latent_channels),
-            output_dim=input_dim, hidden_dim=256, num_hidden_layers=2)
-
-    def generate(self, x):
-        d = self.tcn.representations(x) 
-        d_shift = [(nn.functional.pad(d[i], pad=(1, 0))[:,:,:-1]) \
-            for i in range(len(d))]   
-        z_p, _, _ = self.prior(d_shift)
-        x_hat = self.generative_model(z_p)          
-        return x_hat
-
+        self.encoder = Encoder(tcn_channels, latent_channels, concat_z, 
+            num_hid_layers=1)    
+        self.decoder = Decoder(dec_channels)
+        
     def encode(self, x):
         d = self.tcn.representations(x[None,:,:]) 
-        d_shift = [(nn.functional.pad(d[i], pad=(1, 0))[:,:,:-1]) \
-            for i in range(len(d))]    
-        z_p, mu_p, logvar_p = self.prior(d_shift)
-        z_q, mu_q, logvar_q = self.approx_posterior(d, mu_p, logvar_p)
+        z_q, mu_q, logvar_q = self.encoder(d)
         return z_q[0,:,:]
     
     def decode(self, z):
-        x_hat = self.generative_model(z[None,:,:])
+        x_hat = self.decoder(z[None,:,:])
         return x_hat[0,:,:]
 
     def forward(self, x):
-        d = self.tcn.representations(x) 
-        d_shift = [(nn.functional.pad(d[i], pad=(1, 0))[:,:,:-1]) \
-            for i in range(len(d))]    
-        z_p, mu_p, logvar_p = self.prior(d_shift)
-        z_q, mu_q, logvar_q = self.approx_posterior(d, mu_p, logvar_p)
-        x_hat = self.generative_model(z_q)
-        return x_hat, z_p, z_q, mu_p, logvar_p, mu_q, logvar_q
-    
-
-def loss_function(x, recon_x, mu_p, logvar_p, mu_q, logvar_q, annealing): 
-    # Kullback-Leibler divergence
-    N, D, L =  logvar_q[-1].shape
-    num_latent_layers = len(mu_p)
-    loss_KL = 1/(2*N*L)*torch.sum(torch.pow(torch.exp(logvar_p[-1]), -1)
-        *torch.exp(logvar_q[-1]) + torch.exp(logvar_p[-1])
-        *torch.pow(mu_p[-1]-mu_q[-1], 2) + logvar_p[-1]-logvar_q[-1])-D/2 
-    for i in range(num_latent_layers-1):
-        var_p = torch.exp(logvar_p[i])
-        var_q = torch.exp(logvar_q[i])
-        N, D, L = var_p.shape
-        loss_KL += 1/(2*N*L)*torch.sum(torch.pow(var_p, -1)*var_q 
-            + var_p*torch.pow(mu_p[i]- mu_q[i], 2) + torch.log(var_p) 
-            - torch.log(var_q))-D/2
-
-    # Reconstruction loss
-    N, F, L = x.shape  
-    recon_loss = 1/(N*F*L)*torch.sum(torch.pow(torch.log(x+1e-8) 
-        - torch.log(recon_x+1e-8), 2))
-    
-    return annealing*loss_KL + recon_loss
-    
-
-    
+        d = self.tcn.representations(x)
+        z_q, mu_q, logvar_q = self.encoder(d)
+        x_hat = self.decoder(z_q)
+        return x_hat, mu_q, logvar_q

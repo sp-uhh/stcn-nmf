@@ -1,0 +1,52 @@
+# IDE-related
+.vscode
+
+# Python-related compilation
+__pycache__
+__pycache__/
+
+# pytest-related
+*.pytest_cache
+
+# Package egg-info
+*.egg-info
+
+# data
+data/
+
+
+# ignore the following data types
+*.npy
+*.c
+*.so
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.pdf
+*.gz
+*.ipe
+*.zip
+*.nav
+*.out
+*.snm
+*.toc
+*.sty
+*.auxlock
+*.bcf
+*.vrb
+*.snm
+*.xml
+*.json
+*.eps
+*.md5
+*.svg
+*.pt
+*.pyc
+
+# ignore OS generated files
+.DS_Store
+._.DS_Store
+.ipynb_checkpoints/

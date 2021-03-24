@@ -10,6 +10,7 @@ latent_channels = [16]
 dec_channels = [16, 128, 128, 513]
 concat_z = False
 ```
+3/24/2021: STFT is being calculated on GPU 
 
 Whenever you use this code for any experiments and/or publications you need to cite our original paper [1].
 

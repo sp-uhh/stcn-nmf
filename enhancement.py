@@ -1,85 +1,52 @@
+import sys
 import torch
 import pickle
 import numpy as np
 
-from vae import VAE
 from stcn import STCN
 from mcem import MCEM
-from utils import count_parameters
+from glob import glob
 from librosa import stft, istft
 
 
+model_path = 'models/stcn_2021-03-24_21:36:01_001_vloss_758.pt'
+eval_stcn = True
 
 ########################## CONFIGURATION #######################################
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-test_data = pickle.load(open('data/mixture.p', 'rb'))
+test_data = pickle.load(open('data/mixture.pkl', 'rb'))
 
+time_stemp = model_path[0:31]
 
-############################## VAE #############################################
+with open('{}.pkl'.format(time_stemp), 'rb') as f: 
+    tcn_channels, tcn_kernel, tcn_res, concat_z, num_enc_layers, \
+        latent_channels, dec_channels, dec_kernal, dropout, activation = pickle.load(f)
 
-vae_model_path = 'models/vae_200_vloss_0476.pt'
+stcn = STCN(tcn_channels, tcn_kernel, tcn_res, concat_z, 
+        num_enc_layers, latent_channels, dec_channels, dec_kernal, dropout, 
+        activation).to(device)  
 
-vae = VAE(in_out_dim=513, hid_dim=128, latent_dim=16, 
-    num_hid_layers=2).to(device)
-vae.load_state_dict(torch.load(vae_model_path))
-vae.eval()
-for param in vae.parameters(): param.requires_grad = False
-
-s_hat = []
-win = np.sin(np.arange(.5,1024-.5+1)/1024*np.pi) 
-
-for i, x in enumerate(test_data):
-    print('File {}/{}'.format(i+1,len(test_data)), end="\r")
-    x = x/np.max(x)
-    T_orig = len(x)
-    
-    Y = stft(x, n_fft=1024, hop_length=256, win_length=1024, window=win)
-    
-    mcem = MCEM(Y, vae, device)
-    mcem.run()
-    mcem.separate(niter_MH=100, burnin=75)
-
-    S_hat = mcem.S_hat + np.finfo(np.float32).eps
-    s_hat.append(istft(stft_matrix=S_hat, hop_length=256, win_length=1024, 
-        window=win, length=T_orig))
-    
-pickle.dump(s_hat, open('data/pickle/s_hat_vae.p', 'wb'), protocol=4)
-
-
-############################## STCN ############################################
-
-stcn_path = 'models/stcn_2021-03-18_14:14:59_192_vloss_850.pt'
-time_stemp = stcn_path[0:31]
-
-with open('{}_param.pkl'.format(time_stemp), 'rb') as f: 
-    input_dim, tcn_channels, latent_channels, dec_channels, concat_z, dropout, \
-        kernel_size = pickle.load(f)
-
-stcn = STCN(input_dim, tcn_channels, latent_channels, dec_channels, concat_z,
-    dropout, kernel_size).to(device)  
-
-stcn.load_state_dict(torch.load(stcn_path))
+stcn.load_state_dict(torch.load(model_path))
 stcn.eval()
 for param in stcn.parameters(): param.requires_grad = False
 
-s_hat = []
-win = np.sin(np.arange(.5,1024-.5+1)/1024*np.pi) 
+s_hat_stcn = []
+
+############################ ENHANCEMENT #######################################
 
 for i, x in enumerate(test_data):
-    print('File {}/{}'.format(i+1,len(test_data)), end="\r")
-    x = x/np.max(x)
+    print('Enhance File {}/{}'.format(i+1,len(test_data)), end="\r")
     T_orig = len(x)
     
-    Y = stft(x, n_fft=1024, hop_length=256, win_length=1024, window=win)
-    
-    mcem = MCEM(Y, stcn, device)
+    X = stft(x, 1024, 256, 1024, np.hanning(1024))
+
+    mcem = MCEM(X, stcn, device)
     mcem.run()
     mcem.separate(niter_MH=100, burnin=75)
+    S_hat_stcn = mcem.S_hat + np.finfo(np.float32).eps
+    s_hat_stcn.append(istft(S_hat_stcn, 256, 1024, np.hanning(1024), length=T_orig))
 
-    S_hat = mcem.S_hat + np.finfo(np.float32).eps
-    s_hat.append(istft(stft_matrix=S_hat, hop_length=256, win_length=1024, 
-        window=win, length=T_orig))
-    
-pickle.dump(s_hat, open('data/pickle/s_hat_stcn.p', 'wb'), protocol=4)
+pickle.dump(s_hat_stcn, open('data/s_hat_stcn.p', 'wb'), protocol=4)
+

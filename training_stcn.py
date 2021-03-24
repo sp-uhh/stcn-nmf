@@ -7,7 +7,7 @@ import pickle
 import matplotlib.pyplot as plt 
 
 from torch.utils.data import DataLoader
-from dataset import Spectrogram, collate_fn
+from dataset import CleanSpeech
 from stcn import STCN
 from utils import count_parameters
 
@@ -16,62 +16,103 @@ from utils import count_parameters
 
 batch_size = 16
 learning_rate = 1e-3
-num_annealing = 10
+num_annealing = 5
 epochs = 200
-input_dim = 513
+min_spec_energy = 1e-11
+standard_normal_prior = True
 
-kernel_size = 2
-tcn_channels = [128, 128]
-latent_channels = [16, 4]
-dec_channels = [16, 128, 128, 513]
+tcn_channels = [513, 128, 128]
+tcn_kernel = 2
+tcn_res = False
 concat_z = False
-dropout = 0.1
+num_enc_layers = 1
+latent_channels = [16, 16]
+dec_channels = [16, 128, 128, 513]
+dec_kernal = 1
+dropout = 0.2
+activation = torch.tanh
 
+# Print batch loss every [batch_verbose] batch 
 verbose = True
+batch_verbose = 50
+
+# For retraining an existing model 
+retrain = False
+stcn_path = ''
+start_epoch = 1
+
 
 ########################## CONFIGURATION #######################################
 
 # Time stemp for model file
-time_stamp = time.localtime() 
-time_string = time.strftime("%Y-%m-%d_%H:%M:%S", time_stamp)
-print('stcn_{}'.format(time_string))
+if retrain:
+    time_string = stcn_path[12:31]
+else:
+    time_stamp = time.localtime() 
+    time_string = time.strftime("%Y-%m-%d_%H:%M:%S", time_stamp)
+    print('stcn_{}'.format(time_string))
 
+# Computing device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load training and validation data
-train_data = pickle.load(open('data/si_tr_s_split.p', 'rb'))
-valid_data = pickle.load(open('data/si_dt_05_split.p', 'rb'))
-    
-train_dataset = Spectrogram(train_data)
-valid_dataset = Spectrogram(valid_data)
+clean_train_data = pickle.load(open('data/si_tr_s.pkl', 'rb'))
+clean_valid_data = pickle.load(open('data/si_dt_05.pkl', 'rb'))
+
+train_dataset = CleanSpeech(clean_train_data)
+valid_dataset = CleanSpeech(clean_valid_data)
 
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-    collate_fn=collate_fn, drop_last=True)
+    drop_last=True)
 valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False,
-    collate_fn=collate_fn, drop_last=True)
+    drop_last=True)
 
-# Create model
-model = STCN(input_dim, tcn_channels, latent_channels, dec_channels, concat_z,
-    dropout, kernel_size).to(device)  
+# Retraining an existing model 
+if retrain:
+    with open('models/stcn_{}.pkl'.format(time_string), 'rb') as f: 
+        tcn_channels, tcn_kernel, tcn_res, concat_z, num_enc_layers, \
+        latent_channels, dec_channels, dec_kernal, dropout, activation \
+            = pickle.load(f)
 
-print('Parameters: {}'.format(count_parameters(model)))
+    model = STCN(tcn_channels, tcn_kernel, tcn_res, concat_z, 
+        num_enc_layers, latent_channels, dec_channels, dec_kernal, dropout, 
+        activation).to(device)  
 
+    model.load_state_dict(torch.load(stcn_path))
+
+# Create new model
+else:
+    model = STCN(tcn_channels, tcn_kernel, tcn_res, concat_z, 
+        num_enc_layers, latent_channels, dec_channels, dec_kernal, dropout, 
+        activation).to(device)  
+    start_epoch = 1
+
+# Define optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+# Define Hann window function for STFT 
+hann = torch.hann_window(1024, device=device)
 
 batch_loss_vec = []; train_loss_vec = []; valid_loss_vec = []
 
+
 ############################## TRAINING ########################################
 
-def loss_function(x, recon_x, mu, logvar, annealing): 
+def loss_function(S, recon_S, mu_p, logvar_p, mu_q, logvar_q, annealing): 
     # Reconstruction loss
-    _, _, L = x.shape   
-    recon = 1/L*torch.sum(x/(recon_x) - torch.log(x/(recon_x)) - 1) 
+    N, F, L = S.shape  
+    recon = 1/L*torch.sum(S/(recon_S) - torch.log(S/(recon_S)) - 1)
+    
+    # Kullback-Leibler divergence
+    N, D, L =  logvar_q[-1].shape
+    num_latent_layers = len(mu_q)
 
     KL = 0
-    # Kullback-Leibler divergence  
-    for i in range(len(mu)):
-        KL += -0.5/L * torch.sum(logvar[i] - mu[i].pow(2) - logvar[i].exp())
-
+    for i in range(num_latent_layers):
+        N, D, L = mu_q[i].shape
+        KL += (1/(2*N*L))*(torch.sum(logvar_p[i]-logvar_q[i] 
+                + logvar_q[i].exp()/logvar_p[i].exp() 
+                + ((mu_p[i]-mu_q[i])**2)/(logvar_p[i].exp()))-D)
+    
     return recon + annealing*KL, recon, KL
 
 def train(epoch):
@@ -79,16 +120,34 @@ def train(epoch):
     train_loss = 0; batch_loss = 0; recon_loss = 0; KL_loss = 0
     annealing = min(1.0, float(epoch)/float(num_annealing)) 
     for batch_idx, data in enumerate(train_loader):
-        x = data.to(device)
+
+        # Clear gradients
         optimizer.zero_grad()
-        recon_x, mu_q, logvar_q = model(x)
-        loss, recon, KL = loss_function(x, recon_x, mu_q, logvar_q, annealing)
+
+        s = data.to(device)
+        S = torch.clamp(torch.abs(torch.stft(s, n_fft=1024, hop_length=256, 
+            win_length=1024, window=hann, center=True, pad_mode='reflect',  
+            normalized=False, onesided=None, return_complex=True))**2, 
+            min=min_spec_energy)
+        recon_S, mu_p, logvar_p, mu_q, logvar_q = model(S)
+        
+        # Regularization with standard normal prior
+        if standard_normal_prior:
+            mu_p = []; logvar_p = []
+            for i in range(len(mu_q)):
+                mu_p += [torch.zeros(mu_q[i].shape, device=device)]
+                logvar_p += [torch.zeros(logvar_q[i].shape, device=device)]
+
+        loss, recon, KL = loss_function(S, recon_S, mu_p, 
+            logvar_p, mu_q, logvar_q, annealing)
+        
+        # Backward pass
         loss.backward()
         train_loss += loss.item()
         optimizer.step()
         batch_loss_vec.append(loss.item()/batch_size)
 
-        if verbose: 
+        if verbose and (batch_idx + 1) % batch_verbose == 0: 
             sys.stdout.write("\033[K") 
             print('\r', ' Epoch: {}   Batch {}/{}:  Loss: {:.0f}  Recon: {:.0f}  KL: {:.2f}'
                 .format(epoch, batch_idx+1, len(train_loader), 
@@ -97,20 +156,36 @@ def train(epoch):
                 end="\r")
     return train_loss
       
-    
 def validate():
     model.eval()
     valid_loss = 0
     with torch.no_grad():
         for batch_idx, data in enumerate(valid_loader):
-            x = data.to(device)
-            recon_x, mu_q, logvar_q = model(x)
-            loss, recon, KL = loss_function(x, recon_x, mu_q, logvar_q, 1.0)
+
+            s = data.to(device)
+            S = torch.clamp(torch.abs(torch.stft(s, n_fft=1024, hop_length=256, 
+                win_length=1024, window=hann, center=True, pad_mode='reflect',  
+                normalized=False, onesided=None, return_complex=True))**2, 
+                min=min_spec_energy)
+            recon_S, mu_p, logvar_p, mu_q, logvar_q = model(S)
+
+            # Regularization with standard normal prior
+            if standard_normal_prior:
+                mu_p = []; logvar_p = []
+                for i in range(len(mu_q)):
+                    mu_p += [torch.zeros(mu_q[i].shape, device=device)]
+                    logvar_p += [torch.zeros(logvar_q[i].shape, device=device)]
+            else:
+                for i in range(len(logvar_p)):
+                    logvar_p[i] = torch.log(logvar_p[i].exp() + 0.1)
+
+            loss, recon, KL = loss_function(S, recon_S, mu_p, logvar_p, mu_q, 
+                logvar_q, 1.0)
             valid_loss += loss.item()
     return valid_loss
 
 # Start training
-for epoch in range(1, epochs + 1):
+for epoch in range(start_epoch, epochs + 1):
 
     # Training step
     train_loss = train(epoch)
@@ -152,6 +227,7 @@ for epoch in range(1, epochs + 1):
 
     # Save model hyper-parameters
     if epoch == 1:
-        with open('models/stcn_{}_param.pkl'.format(time_string), 'wb') as f:  
-            pickle.dump([input_dim, tcn_channels, latent_channels, dec_channels, 
-                concat_z, dropout, kernel_size], f)
+        with open('models/stcn_{}.pkl'.format(time_string), 'wb') as f:  
+            pickle.dump([tcn_channels, tcn_kernel, tcn_res, concat_z,
+                num_enc_layers, latent_channels, dec_channels, dec_kernal,
+                dropout, activation], f)

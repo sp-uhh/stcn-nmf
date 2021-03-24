@@ -16,6 +16,17 @@ hop = np.int(hop_percent*wlen)
 nfft = wlen
 
 
+class CleanSpeech(Dataset):
+    def __init__(self, data):
+        self.data = data
+        self.index = np.arange(len(self.data))
+ 
+    def __getitem__(self, i):
+        return self.data[i]
+    
+    def __len__(self):
+        return len(self.data)
+
 class Spectrogram(Dataset):
     def __init__(self, data):
         self.data = data

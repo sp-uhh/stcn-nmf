@@ -22,7 +22,7 @@ create_test_data = True
 
 if create_training_data:
 
-    data_dir = '../vae-speech-modeling/data/CSR-1-WSJ-0/WAV/wsj0/si_tr_s'
+    data_dir = 'data/CSR-1-WSJ-0/WAV/wsj0/si_tr_s'
     audio_paths = sorted(glob(data_dir + '/**/*.wav', recursive=True))
 
     audio_files = []
@@ -49,7 +49,7 @@ if create_training_data:
 
 if create_validation_data:
 
-    data_dir = '../vae-speech-modeling/data/CSR-1-WSJ-0/WAV/wsj0/si_dt_05'
+    data_dir = 'data/CSR-1-WSJ-0/WAV/wsj0/si_dt_05'
     audio_paths = sorted(glob(data_dir + '/**/*.wav', recursive=True))
 
     audio_files = []
@@ -77,7 +77,7 @@ if create_validation_data:
 if create_test_data:
 
     # Load noise
-    data_dir = '../vae-speech-modeling/data/QUT-NOISE/QUT-NOISE/'
+    data_dir = 'data/QUT-NOISE/QUT-NOISE/'
 
     types = ['cafe', 'home', 'street', 'car']
 
@@ -93,7 +93,7 @@ if create_test_data:
     street = resample(street, fs_street, fs)
 
     # Load speech data
-    data_dir = '../vae-speech-modeling/data/CSR-1-WSJ-0/WAV/wsj0/si_et_05'
+    data_dir = 'data/CSR-1-WSJ-0/WAV/wsj0/si_et_05'
     audio_paths = sorted(glob(data_dir + '/**/*.wav', recursive=True))
 
     audio_files = []

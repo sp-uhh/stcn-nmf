@@ -9,7 +9,7 @@ from glob import glob
 from librosa import stft, istft
 
 
-model_path = 'models/stcn_2021-03-24_21:36:01_001_vloss_758.pt'
+model_path = ''
 eval_stcn = True
 
 ########################## CONFIGURATION #######################################
